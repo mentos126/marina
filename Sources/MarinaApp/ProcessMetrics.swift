@@ -144,6 +144,7 @@ enum ResourcePressure {
 enum ProcessMetricsSampler {
     static func sample(
         rootProcessIDs: Set<Int32>,
+        includeExternalProcesses: Bool = true,
         includeExternalDetails: Bool = true
     ) -> ProcessMetricsSample {
         let process = Process()
@@ -269,6 +270,13 @@ enum ProcessMetricsSampler {
                     return lhs.pid < rhs.pid
                 }
             )
+        }
+
+        // The external list exists only for the Resources screen. When nothing
+        // is displaying it, everything below — including two `lsof` calls — is
+        // work with no reader.
+        guard includeExternalProcesses else {
+            return ProcessMetricsSample(managedByRoot: managedByRoot, externalProcesses: [])
         }
 
         // System-wide visibility is intentionally limited to the current

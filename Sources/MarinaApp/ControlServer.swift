@@ -128,6 +128,9 @@ final class ControlServer {
                 return (200, try ok(["pong": marinaVersion]))
 
             case ("GET", "/status"):
+                // A CLI reading metrics counts as an observer: it keeps the
+                // sampler warm and refreshes a sample the idle cadence let age.
+                supervisor.noteControlAPIActivity()
                 return (200, try ok(supervisor.status))
 
             case ("GET", "/config"):

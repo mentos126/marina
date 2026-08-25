@@ -8,11 +8,28 @@ Marina requires macOS 14 or newer and Swift 6.
 
 ## Smart resource dashboard
 
-The native **Resources** screen samples every Marina-owned process tree every two seconds and keeps a five-minute memory history. It shows physical footprint, resident RAM, CPU, project trends, and the current user's heaviest processes running outside Marina. Configure the optional global project limit and per-project inherit/off/custom overrides in **Settings → Memory**. A project restarts after three consecutive over-limit footprint samples, then sampling starts fresh on the replacement processes.
+The native **Resources** screen samples every Marina-owned process tree every two seconds while it is on screen, and keeps a five-minute memory history. It shows physical footprint, resident RAM, CPU, project trends, and the current user's heaviest processes running outside Marina. Configure the optional global project limit and per-project inherit/off/custom overrides in **Settings → Memory**. A project restarts after three consecutive over-limit footprint samples, then sampling starts fresh on the replacement processes.
 
 Marina turns those measurements into machine-aware recommendations instead of relying on one fixed limit. It detects unusually large servers and processes, sustained growth while ignoring isolated build spikes, and duplicate dev sessions outside Marina. Advice is tailored to common Next.js, Vite, Node, TypeScript, browser, Docker, Redis, and Postgres failure modes. Managed servers can be restarted or stopped from the recommendation card. External process cards show the validated stop target, parent, working directory, listening ports, and the difference between footprint and resident RAM; an explicit confirmation can send SIGTERM, but Marina never terminates them automatically or escalates to SIGKILL.
 
 When Docker Desktop owns a published host port, Marina resolves the actual container through the Docker CLI. **Stop** and **Move to Marina** stop only that container instead of signaling the global `com.docker.backend` process.
+
+## Energy
+
+Marina is meant to run all day, so it samples only for a reader that exists. Each sample spawns `/bin/ps` across the whole process table, and the working-directory and listener enrichment adds two `lsof` calls that walk every file descriptor on the machine. The cadence follows what is actually on screen:
+
+| Situation | Sampling |
+| --- | --- |
+| Resources screen visible | every 2s, with the `lsof` enrichment |
+| A window visible on another screen | every 6s, no enrichment |
+| A project memory limit is armed | every 5s, no enrichment |
+| Menu bar only, servers running | every 15s, no enrichment |
+| Nothing running and nothing on screen | suspended |
+| Display or machine asleep | suspended |
+
+Low Power Mode halves every rate and drops the enrichment. The Ports screen stops its own `lsof` loop when its window is hidden. Every timer carries a tolerance so macOS can coalesce Marina's wakeups with ones it already has to make instead of interrupting an idle core on an exact deadline.
+
+Metrics still reach the CLI: `marina status` counts as a reader, refreshing a sample the idle cadence let age and keeping the sampler warm for a minute so a polling agent reads fresh numbers.
 
 ## Install
 

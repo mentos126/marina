@@ -8,6 +8,7 @@ struct ResourceDashboard: View {
     @State private var pendingExternalStop: ExternalProcessSnapshot?
     @State private var processActionError: String?
     @State private var stoppingProcessIDs = Set<Int32>()
+    @State private var observingResources = false
 
     private var serverRows: [DashboardServerRow] {
         supervisor.runtimes.values.compactMap { runtime in
@@ -142,6 +143,19 @@ struct ResourceDashboard: View {
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .navigationTitle("Resources")
+        // This screen is the only reader of the full sample. Registering it
+        // here is what buys the live two-second cadence; leaving lets the
+        // supervisor fall back to the cheap one.
+        .onAppear {
+            guard !observingResources else { return }
+            observingResources = true
+            supervisor.beginDashboardObservation()
+        }
+        .onDisappear {
+            guard observingResources else { return }
+            observingResources = false
+            supervisor.endDashboardObservation()
+        }
         .confirmationDialog(
             externalStopTitle,
             isPresented: Binding(

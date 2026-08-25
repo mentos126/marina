@@ -158,6 +158,9 @@ final class ServerRuntime: NSObject, ObservableObject, LocalProcessDelegate, Ter
     }
 
     func updateProcessMetrics(_ metrics: ProcessMetrics?) {
+        // Assigning an identical sample would still publish and redraw every
+        // view bound to this runtime, once per sample, forever.
+        guard metrics != processMetrics else { return }
         processMetrics = metrics
     }
 
@@ -483,6 +486,9 @@ final class ServerRuntime: NSObject, ObservableObject, LocalProcessDelegate, Ter
             }
             self.runHealthCheck()
         }
+        // The startup probe is deliberately impatient, but it still does not
+        // need to interrupt an idle core on an exact deadline.
+        timer.tolerance = 0.2
         healthTimer = timer
         RunLoop.main.add(timer, forMode: .common)
     }
@@ -491,6 +497,9 @@ final class ServerRuntime: NSObject, ObservableObject, LocalProcessDelegate, Ter
         let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             self?.runHealthCheck()
         }
+        // A server that has been up for a while does not turn unhealthy on a
+        // schedule, so let macOS coalesce this probe with other wakeups.
+        timer.tolerance = interval * 0.25
         healthTimer = timer
         RunLoop.main.add(timer, forMode: .common)
     }

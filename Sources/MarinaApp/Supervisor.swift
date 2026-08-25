@@ -34,6 +34,9 @@ final class Supervisor: ObservableObject {
     @Published private(set) var memoryLimitRestarts: [String: MemoryLimitRestartEvent] = [:]
     /// Bumped on any runtime state change so SwiftUI redraws the lists.
     @Published private(set) var revision: Int = 0
+    /// A Marina window is on screen and not fully covered. Screens that poll on
+    /// their own — Ports runs `lsof` — watch this to stand down when hidden.
+    @Published private(set) var uiIsVisible: Bool = false
 
     private let store: ConfigStore
     private(set) var runtimes: [String: ServerRuntime] = [:]
@@ -42,6 +45,15 @@ final class Supervisor: ObservableObject {
     private var metricsSampleInFlight = false
     private var metricsSampleSequence = 0
     private var memoryLimitGuard = MemoryLimitGuard()
+    private let activity = AppActivityMonitor()
+    private var currentCadence: MetricsCadence?
+    private var dashboardObservers = 0
+    private var lastControlAPIActivity: Date?
+    private var lastMetricsSampleAt: Date?
+    /// How long a control API call keeps the sampler warm, so an agent polling
+    /// `marina status` in a loop reads fresh numbers without waking `ps` on the
+    /// request path every time.
+    private static let controlAPIInterestWindow: TimeInterval = 60
 
     var settings: MarinaConfig { store.config }
 
@@ -56,7 +68,15 @@ final class Supervisor: ObservableObject {
             self.bump()
         }
         store.startWatching()
-        startMetricsTimer()
+        activity.onChange = { [weak self] in
+            guard let self else { return }
+            if self.uiIsVisible != self.activity.windowVisible {
+                self.uiIsVisible = self.activity.windowVisible
+            }
+            self.updateMetricsSchedule()
+        }
+        uiIsVisible = activity.windowVisible
+        updateMetricsSchedule()
     }
 
     // MARK: - Runtime bookkeeping
@@ -100,6 +120,8 @@ final class Supervisor: ObservableObject {
 
     private func bump() {
         revision &+= 1
+        // A server starting or stopping changes what the sampler has to feed.
+        updateMetricsSchedule()
     }
 
     private func scheduleTemporaryCleanup(runtimeID: String?) {
@@ -118,56 +140,167 @@ final class Supervisor: ObservableObject {
         }
     }
 
-    private func startMetricsTimer() {
-        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+    // MARK: - Metrics scheduling
+
+    /// The Resources screen registers while it is selected, so the sampler knows
+    /// it has a live reader and can pay for the full sample.
+    func beginDashboardObservation() {
+        dashboardObservers += 1
+        updateMetricsSchedule()
+    }
+
+    func endDashboardObservation() {
+        dashboardObservers = max(0, dashboardObservers - 1)
+        updateMetricsSchedule()
+    }
+
+    /// The control API is a reader too: `marina status --details` prints these
+    /// numbers. A call keeps the sampler warm and tops up a stale sample.
+    func noteControlAPIActivity() {
+        lastControlAPIActivity = Date()
+        updateMetricsSchedule()
+        refreshProcessMetricsIfStale(maxAge: EnergyPolicy.observedInterval)
+    }
+
+    private var energyConditions: EnergyConditions {
+        let controlAPIActive = lastControlAPIActivity.map {
+            Date().timeIntervalSince($0) < Self.controlAPIInterestWindow
+        } ?? false
+        let enforcesMemoryLimits = projects.contains { project in
+            project.effectiveMemoryLimit(global: store.config.globalMemoryLimitBytes) != nil
+                && runtimes(inProject: project.id).contains { $0.isRunning }
+        }
+        return EnergyConditions(
+            dashboardSelected: dashboardObservers > 0,
+            windowVisible: uiIsVisible,
+            hasRunningServers: runtimes.values.contains { $0.isRunning },
+            controlAPIActive: controlAPIActive,
+            enforcesMemoryLimits: enforcesMemoryLimits,
+            asleep: activity.asleep,
+            lowPower: activity.lowPower
+        )
+    }
+
+    /// Rebuilds the sampling timer whenever the conditions call for a different
+    /// cadence. Sampling stops outright when nothing can read the result.
+    private func updateMetricsSchedule() {
+        let cadence = EnergyPolicy.cadence(for: energyConditions)
+        guard cadence != currentCadence else { return }
+        let previous = currentCadence
+        currentCadence = cadence
+
+        metricsTimer?.invalidate()
+        metricsTimer = nil
+
+        guard let cadence else { return }
+
+        let timer = Timer(timeInterval: cadence.interval, repeats: true) { [weak self] _ in
             self?.refreshProcessMetrics()
         }
+        // Tolerance lets macOS fire this alongside wakeups it already has to
+        // make, instead of interrupting an idle core on an exact deadline.
+        timer.tolerance = cadence.tolerance
         metricsTimer = timer
         RunLoop.main.add(timer, forMode: .common)
-        refreshProcessMetrics()
+
+        // Moving up a tier — a window opened, the dashboard appeared — has to
+        // show fresh numbers now, not after one full interval.
+        let widened = previous.map {
+            cadence.interval < $0.interval
+                || (cadence.includesExternalProcesses && !$0.includesExternalProcesses)
+        } ?? true
+        if widened { refreshProcessMetrics() }
     }
 
     private func refreshProcessMetrics() {
-        guard !metricsSampleInFlight else { return }
+        guard !metricsSampleInFlight, let cadence = currentCadence else { return }
 
-        let targets = runtimes.compactMapValues { runtime in
-            runtime.isRunning ? runtime.pid : nil
-        }
-        for runtime in runtimes.values where !runtime.isRunning {
-            runtime.updateProcessMetrics(nil)
-        }
+        let targets = runningTargets()
+        // Nothing running and no external list to build: `ps` would be spawned
+        // to produce an empty sample.
+        guard !targets.isEmpty || cadence.includesExternalProcesses else { return }
 
         metricsSampleInFlight = true
         metricsSampleSequence &+= 1
-        // `ps` remains live every two seconds. More expensive cwd/listener
-        // enrichment runs every ten seconds and is retained between samples.
-        let includeExternalDetails = externalProcesses.isEmpty || metricsSampleSequence.isMultiple(of: 5)
+        // The cwd/listener enrichment is two `lsof` calls over every file
+        // descriptor on the machine, so it stays on the dashboard's cadence and
+        // its results are retained between samples.
+        let includeExternalProcesses = cadence.includesExternalProcesses
+        let includeExternalDetails = cadence.allowsExternalDetails
+            && (externalProcesses.isEmpty || metricsSampleSequence.isMultiple(of: 5))
         let rootProcessIDs = Set(targets.values)
         metricsQueue.async { [weak self] in
             let sample = ProcessMetricsSampler.sample(
                 rootProcessIDs: rootProcessIDs,
+                includeExternalProcesses: includeExternalProcesses,
                 includeExternalDetails: includeExternalDetails
             )
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.metricsSampleInFlight = false
-                for (serverID, sampledPID) in targets {
-                    guard let runtime = self.runtimes[serverID], runtime.pid == sampledPID else { continue }
-                    runtime.updateProcessMetrics(sample.managedByRoot[sampledPID])
-                }
-                if includeExternalDetails {
-                    self.externalProcesses = sample.externalProcesses
-                } else {
-                    let previousByPID = Dictionary(uniqueKeysWithValues: self.externalProcesses.map { ($0.pid, $0) })
-                    self.externalProcesses = sample.externalProcesses.map {
-                        $0.preservingDetails(from: previousByPID[$0.pid])
-                    }
-                }
-                self.recordResourceHistory(samples: sample.managedByRoot, targets: targets)
-                self.evaluateMemoryLimits(samples: sample.managedByRoot, targets: targets)
-                self.bump()
+                self.apply(
+                    sample: sample,
+                    targets: targets,
+                    includeExternalProcesses: includeExternalProcesses,
+                    includeExternalDetails: includeExternalDetails
+                )
             }
         }
+    }
+
+    /// Tops the sample up in place when a reader needs numbers the idle cadence
+    /// has not refreshed. This runs `ps` on the calling thread and skips the
+    /// `lsof` enrichment; it is only reached while no window is drawing.
+    private func refreshProcessMetricsIfStale(maxAge: TimeInterval) {
+        guard !metricsSampleInFlight else { return }
+        if let lastMetricsSampleAt, Date().timeIntervalSince(lastMetricsSampleAt) < maxAge { return }
+
+        let targets = runningTargets()
+        guard !targets.isEmpty else { return }
+        let sample = ProcessMetricsSampler.sample(
+            rootProcessIDs: Set(targets.values),
+            includeExternalProcesses: false,
+            includeExternalDetails: false
+        )
+        apply(sample: sample, targets: targets, includeExternalProcesses: false, includeExternalDetails: false)
+    }
+
+    /// The PIDs this sample is attributed to. Anything no longer running loses
+    /// its metrics here rather than keeping the last value on screen.
+    private func runningTargets() -> [String: Int32] {
+        for runtime in runtimes.values where !runtime.isRunning {
+            runtime.updateProcessMetrics(nil)
+        }
+        return runtimes.compactMapValues { $0.isRunning ? $0.pid : nil }
+    }
+
+    private func apply(
+        sample: ProcessMetricsSample,
+        targets: [String: Int32],
+        includeExternalProcesses: Bool,
+        includeExternalDetails: Bool
+    ) {
+        lastMetricsSampleAt = Date()
+        for (serverID, sampledPID) in targets {
+            guard let runtime = runtimes[serverID], runtime.pid == sampledPID else { continue }
+            runtime.updateProcessMetrics(sample.managedByRoot[sampledPID])
+        }
+        // An unobserved sample carries no external list. The previous one is
+        // kept so opening the dashboard has something to draw while the full
+        // sample that opening triggers completes.
+        if includeExternalProcesses {
+            if includeExternalDetails {
+                externalProcesses = sample.externalProcesses
+            } else {
+                let previousByPID = Dictionary(uniqueKeysWithValues: externalProcesses.map { ($0.pid, $0) })
+                externalProcesses = sample.externalProcesses.map {
+                    $0.preservingDetails(from: previousByPID[$0.pid])
+                }
+            }
+        }
+        recordResourceHistory(samples: sample.managedByRoot, targets: targets)
+        evaluateMemoryLimits(samples: sample.managedByRoot, targets: targets)
+        bump()
     }
 
     private func recordResourceHistory(

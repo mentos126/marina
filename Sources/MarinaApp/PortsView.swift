@@ -59,7 +59,11 @@ struct PortsView: View {
             }
         }
         .navigationTitle("Ports")
-        .task {
+        // Each refresh shells out to `lsof` across every open file descriptor
+        // on the machine. Behind a hidden or fully covered window that is pure
+        // cost, so the loop stands down and restarts when the window returns.
+        .task(id: supervisor.uiIsVisible) {
+            guard supervisor.uiIsVisible else { return }
             while !Task.isCancelled {
                 await model.refresh(using: supervisor)
                 try? await Task.sleep(for: .seconds(4))
