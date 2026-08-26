@@ -15,6 +15,7 @@ struct MainView: View {
     @ObservedObject private var appSelection = AppSelection.shared
     @StateObject private var agentSetup = AgentSetup()
     @AppStorage("agentOnboardingDismissed") private var agentOnboardingDismissed = false
+    @AppStorage(SidebarFold.storageKey) private var foldedProjects = ""
     @State private var selection: Selection?
     @State private var editingProject: Project?
     @State private var editingServer: EditingServer?
@@ -126,26 +127,41 @@ struct MainView: View {
 
             ForEach(filteredSidebarProjects) { project in
                 Section {
-                    ProjectHeader(project: project)
-                        .tag(Selection.project(project.id))
-                        .onTapGesture(count: 2) {
-                            if let project = storedProject(project.id) { openProject(project) }
-                        }
-                        .contextMenu {
-                            if let project = storedProject(project.id) { projectMenu(project) }
-                        }
+                    SidebarDropTarget(enabled: reorderEnabled) { drop in
+                        handleDrop(drop, ontoProject: project.id)
+                    } content: {
+                        ProjectHeader(project: project)
+                    }
+                    .tag(Selection.project(project.id))
+                    .sidebarDraggable(.project(project.id), enabled: reorderEnabled)
+                    .onTapGesture(count: 2) {
+                        if let project = storedProject(project.id) { openProject(project) }
+                    }
+                    .contextMenu {
+                        if let project = storedProject(project.id) { projectMenu(project) }
+                    }
 
-                    ForEach(project.servers) { server in
+                    ForEach(visibleServers(of: project)) { server in
                         if let runtime = supervisor.runtime(for: server.id) {
-                            ServerRow(runtime: runtime)
-                                .padding(.leading, 14)
-                                .tag(Selection.server(server.id))
-                                .contextMenu {
-                                    if let project = storedProject(project.id) {
-                                        serverMenu(runtime, project: project)
-                                    }
+                            SidebarDropTarget(enabled: reorderEnabled) { drop in
+                                handleDrop(drop, ontoServer: server.id)
+                            } content: {
+                                ServerRow(runtime: runtime)
+                                    .padding(.leading, 14)
+                            }
+                            .tag(Selection.server(server.id))
+                            .sidebarDraggable(.server(server.id), enabled: reorderEnabled)
+                            .contextMenu {
+                                if let project = storedProject(project.id) {
+                                    serverMenu(runtime, project: project)
                                 }
+                            }
                         }
+                    }
+
+                    let stopped = stoppedCount(project)
+                    if stopped > 0, !SidebarSearch.isActive(search) {
+                        stoppedServersToggle(project, count: stopped)
                     }
                 }
             }
@@ -158,9 +174,10 @@ struct MainView: View {
                     .background(.background)
             }
         }
-        // Running projects float to the top, so rows change place on their own.
-        // Letting them travel keeps the list readable instead of teleporting.
-        .animation(Motion.reorder, value: runningSignature)
+        // Rows change place when the user drags one, and disappear when a fold
+        // closes. Letting them travel keeps the list readable instead of
+        // teleporting.
+        .animation(Motion.reorder, value: layoutSignature)
         .safeAreaInset(edge: .top, spacing: 0) { sidebarSearch }
         .safeAreaInset(edge: .bottom) { sidebarActions }
         .onExitCommand {
@@ -168,31 +185,22 @@ struct MainView: View {
         }
     }
 
-    /// Changes exactly when the running/idle split changes, which is what drives
-    /// the sidebar order — not on every uptime tick.
-    private var runningSignature: String {
-        supervisor.projects
-            .map { projectIsRunning($0) ? "1" : "0" }
-            .joined()
+    /// Changes exactly when a row moves, appears or disappears — the order the
+    /// user arranged, the folds, and the running/stopped split a fold reads.
+    /// Not on every uptime tick.
+    private var layoutSignature: String {
+        let rows = supervisor.projects.map { project in
+            project.id + ":" + project.servers.map { server in
+                server.id + (supervisor.runtime(for: server.id)?.state == .stopped ? "-" : "+")
+            }.joined(separator: ",")
+        }
+        return rows.joined(separator: "|") + "#" + foldedProjects
     }
 
-    private var sidebarProjects: [Project] {
-        supervisor.projects.enumerated()
-            .sorted { lhs, rhs in
-                let lhsIsRunning = projectIsRunning(lhs.element)
-                let rhsIsRunning = projectIsRunning(rhs.element)
-
-                if lhsIsRunning != rhsIsRunning {
-                    return lhsIsRunning
-                }
-
-                return lhs.offset < rhs.offset
-            }
-            .map(\.element)
-    }
-
+    /// The stored order, shown as it is: the sidebar is what the user arranges
+    /// by dragging, so nothing re-sorts it behind their back.
     private var filteredSidebarProjects: [Project] {
-        SidebarSearch.filterProjects(sidebarProjects, query: search)
+        SidebarSearch.filterProjects(supervisor.projects, query: search)
     }
 
     private var filteredTemporaryRuntimes: [ServerRuntime] {
@@ -216,7 +224,7 @@ struct MainView: View {
     private func activateFirstMatch() {
         switch SidebarSearch.firstMatch(
             temporaryServers: supervisor.visibleTemporaryRuntimes.map(\.config),
-            projects: sidebarProjects,
+            projects: supervisor.projects,
             query: search
         ) {
         case .server(let id):
@@ -228,12 +236,6 @@ struct MainView: View {
         }
     }
 
-    private func projectIsRunning(_ project: Project) -> Bool {
-        project.servers.contains { server in
-            supervisor.runtime(for: server.id)?.isRunning == true
-        }
-    }
-
     private func openProject(_ project: Project) {
         guard let url = project.servers
             .compactMap({ supervisor.runtime(for: $0.id)?.url })
@@ -242,6 +244,97 @@ struct MainView: View {
         else { return }
 
         NSWorkspace.shared.open(link)
+    }
+
+    // MARK: - Folding stopped servers
+
+    private var selectedServerID: String? {
+        if case .server(let id) = selection { return id }
+        return nil
+    }
+
+    private func isFolded(_ projectID: String) -> Bool {
+        // A search must never be answered with rows a fold is hiding.
+        !SidebarSearch.isActive(search) && SidebarFold.isFolded(projectID, in: foldedProjects)
+    }
+
+    private func visibleServers(of project: Project) -> [ServerConfig] {
+        SidebarFold.visibleServers(
+            project.servers,
+            folded: isFolded(project.id),
+            state: { supervisor.runtime(for: $0)?.state },
+            selectedServerID: selectedServerID
+        )
+    }
+
+    private func stoppedCount(_ project: Project) -> Int {
+        SidebarFold.foldableCount(project.servers, state: { supervisor.runtime(for: $0)?.state })
+    }
+
+    private func toggleFold(_ projectID: String) {
+        foldedProjects = SidebarFold.toggling(
+            projectID,
+            in: foldedProjects,
+            existing: supervisor.projects.map(\.id)
+        )
+    }
+
+    private func stoppedServersToggle(_ project: Project, count: Int) -> some View {
+        let folded = isFolded(project.id)
+
+        return Button {
+            toggleFold(project.id)
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: folded ? "chevron.right" : "chevron.down")
+                    .font(.system(size: 9, weight: .bold))
+                    .frame(width: 9)
+                Text(count == 1 ? "1 stopped" : "\(count) stopped")
+                Spacer()
+            }
+            .foregroundStyle(.secondary)
+            .padding(.leading, 14)
+            .padding(.vertical, 1)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .font(MarinaTypography.metadata)
+        .selectionDisabled()
+        .help(folded ? "Show the stopped servers of this project" : "Fold the stopped servers of this project away")
+        .accessibilityLabel(folded ? "Show \(count) stopped servers" : "Hide \(count) stopped servers")
+    }
+
+    // MARK: - Drag and drop
+
+    /// Dragging rearranges the stored order, so it stays off while a search is
+    /// showing a partial list: a drop there would land relative to rows the user
+    /// cannot see.
+    private var reorderEnabled: Bool {
+        !SidebarSearch.isActive(search)
+    }
+
+    private func handleDrop(_ drop: SidebarDrag, ontoProject projectID: String) -> Bool {
+        switch drop.kind {
+        case .project:
+            guard drop.id != projectID else { return false }
+            supervisor.moveProject(id: drop.id, onto: projectID)
+        case .server:
+            // Temporary jobs are not in the config, so they have no slot to move.
+            guard !supervisor.temporaryRuntimeIDs.contains(drop.id) else { return false }
+            supervisor.moveServer(id: drop.id, toTopOf: projectID)
+        }
+        return true
+    }
+
+    private func handleDrop(_ drop: SidebarDrag, ontoServer serverID: String) -> Bool {
+        guard drop.kind == .server,
+              drop.id != serverID,
+              !supervisor.temporaryRuntimeIDs.contains(drop.id),
+              !supervisor.temporaryRuntimeIDs.contains(serverID)
+        else { return false }
+
+        supervisor.moveServer(id: drop.id, ontoServer: serverID)
+        return true
     }
 
     private var sidebarSearch: some View {
@@ -329,6 +422,11 @@ struct MainView: View {
     private func projectMenu(_ project: Project) -> some View {
         Button("Start All") { supervisor.startProject(project.id) }
         Button("Stop All") { supervisor.stopProject(project.id) }
+        if stoppedCount(project) > 0 {
+            Button(isFolded(project.id) ? "Show Stopped Servers" : "Hide Stopped Servers") {
+                toggleFold(project.id)
+            }
+        }
         Divider()
         Button("Add Server…") {
             editingServer = EditingServer(projectID: project.id, projectName: project.name, projectRoot: project.root, server: nil)
@@ -465,6 +563,55 @@ struct MainView: View {
 
 // MARK: - Sidebar rows
 
+/// Wraps one row so it can accept a dropped row and light up while a drag hovers
+/// it. A view of its own because the highlight is per-row state: the whole
+/// sidebar sharing one flag would flash every row at once.
+private struct SidebarDropTarget<Content: View>: View {
+    let enabled: Bool
+    let perform: (SidebarDrag) -> Bool
+    let content: Content
+
+    @State private var targeted = false
+
+    init(
+        enabled: Bool,
+        perform: @escaping (SidebarDrag) -> Bool,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.enabled = enabled
+        self.perform = perform
+        self.content = content()
+    }
+
+    var body: some View {
+        if enabled {
+            content
+                .background {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.accentColor.opacity(targeted ? 0.18 : 0))
+                }
+                .animation(Motion.hover, value: targeted)
+                .dropDestination(for: SidebarDrag.self) { items, _ in
+                    guard let item = items.first else { return false }
+                    return perform(item)
+                } isTargeted: { targeted = $0 }
+        } else {
+            content
+        }
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func sidebarDraggable(_ payload: SidebarDrag, enabled: Bool) -> some View {
+        if enabled {
+            draggable(payload)
+        } else {
+            self
+        }
+    }
+}
+
 private struct ProjectHeader: View {
     let project: Project
 
@@ -588,11 +735,21 @@ private struct ProjectDetail: View {
                 List {
                     ForEach(project.servers) { server in
                         if let runtime = supervisor.runtime(for: server.id) {
-                            ProjectServerRow(runtime: runtime) { onSelectServer(server.id) }
+                            // Same gesture as the sidebar, so the order can be
+                            // arranged from whichever list is already on screen.
+                            SidebarDropTarget(enabled: true) { drop in
+                                guard drop.kind == .server, drop.id != server.id else { return false }
+                                supervisor.moveServer(id: drop.id, ontoServer: server.id)
+                                return true
+                            } content: {
+                                ProjectServerRow(runtime: runtime) { onSelectServer(server.id) }
+                            }
+                            .draggable(SidebarDrag.server(server.id))
                         }
                     }
                 }
                 .listStyle(.inset)
+                .animation(Motion.reorder, value: project.servers.map(\.id))
             }
         }
         .toolbar {

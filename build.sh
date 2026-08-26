@@ -118,6 +118,21 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<false/>
 	<key>NSSupportsSuddenTermination</key>
 	<false/>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>dev.marina.app.sidebar-row</string>
+			<key>UTTypeDescription</key>
+			<string>Marina sidebar row</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict/>
+		</dict>
+	</array>
 </dict>
 </plist>
 PLIST

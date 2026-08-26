@@ -513,6 +513,48 @@ final class Supervisor: ObservableObject {
         refresh()
     }
 
+    // MARK: - Sidebar order
+
+    /// Drag and drop writes straight into the stored order: the sidebar shows
+    /// `config.projects` as it is, so what the user arranges is what stays.
+    func moveProject(id: String, onto targetID: String) {
+        applyProjectOrder(SidebarReorder.moveProject(in: store.config.projects, id: id, onto: targetID))
+    }
+
+    func moveServer(id: String, ontoServer targetID: String) {
+        let before = SidebarReorder.locate(server: id, in: store.config.projects)
+        let after = SidebarReorder.locate(server: targetID, in: store.config.projects)
+        applyProjectOrder(
+            SidebarReorder.moveServer(in: store.config.projects, id: id, ontoServer: targetID),
+            movedBetween: [before?.projectID, after?.projectID]
+        )
+    }
+
+    func moveServer(id: String, toTopOf projectID: String) {
+        let before = SidebarReorder.locate(server: id, in: store.config.projects)
+        applyProjectOrder(
+            SidebarReorder.moveServer(in: store.config.projects, id: id, toTopOf: projectID),
+            movedBetween: [before?.projectID, projectID]
+        )
+    }
+
+    /// A reorder only ever permutes rows, so comparing IDs is enough to skip a
+    /// pointless write — and a rejected drop must not touch the config file.
+    private func applyProjectOrder(_ projects: [Project], movedBetween projectIDs: [String?] = []) {
+        let signature = { (list: [Project]) in list.map { [$0.id] + $0.servers.map(\.id) } }
+        guard signature(projects) != signature(store.config.projects) else { return }
+
+        // A server that changed project answers to a different memory limit now,
+        // and both footprints just moved. Starting the streaks over keeps a
+        // stale count from restarting a project on the next sample.
+        for id in Set(projectIDs.compactMap { $0 }) {
+            memoryLimitGuard.reset(projectID: id)
+        }
+
+        store.mutate { $0.projects = projects }
+        refresh()
+    }
+
     func updateGlobalMemoryLimit(_ bytes: UInt64?) {
         memoryLimitGuard.resetAll()
         store.mutate { $0.globalMemoryLimitBytes = bytes }
