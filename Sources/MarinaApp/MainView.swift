@@ -22,7 +22,44 @@ struct MainView: View {
     @State private var addingProject = false
     @State private var runningTemporary = false
     @State private var search = ""
+    @State private var pendingRemoval: PendingRemoval?
     @FocusState private var searchFocused: Bool
+
+    /// A removal waiting to be confirmed.
+    ///
+    /// `config.json` is the only record of what a server is, removing one also
+    /// deletes its logs, and neither step is undoable — so the two destructive
+    /// menu items ask first. Temporary rows are deliberately exempt: they are
+    /// disposable by construction, and they are what a user clears in bulk.
+    enum PendingRemoval: Identifiable {
+        case project(id: String, name: String, servers: Int)
+        case server(id: String, name: String, project: String)
+
+        var id: String {
+            switch self {
+            case .project(let id, _, _): "project:\(id)"
+            case .server(let id, _, _): "server:\(id)"
+            }
+        }
+
+        var title: String {
+            switch self {
+            case .project(_, let name, _): "Remove \u{201C}\(name)\u{201D} and its servers?"
+            case .server(_, let name, let project): "Remove \u{201C}\(name)\u{201D} from \(project)?"
+            }
+        }
+
+        var message: String {
+            let kept = "The previous config is kept in ~/.config/marina/backups."
+            switch self {
+            case .project(_, _, let servers):
+                let counted = servers == 1 ? "1 server" : "\(servers) servers"
+                return "\(counted) and their logs are deleted. This cannot be undone. \(kept)"
+            case .server:
+                return "The server and its logs are deleted. This cannot be undone. \(kept)"
+            }
+        }
+    }
 
     var body: some View {
         NavigationSplitView {
@@ -105,7 +142,29 @@ struct MainView: View {
                 }
             }
         }
+        .confirmationDialog(
+            pendingRemoval?.title ?? "",
+            isPresented: Binding(
+                get: { pendingRemoval != nil },
+                set: { if !$0 { pendingRemoval = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: pendingRemoval
+        ) { removal in
+            Button("Remove", role: .destructive) { confirm(removal) }
+            Button("Cancel", role: .cancel) { pendingRemoval = nil }
+        } message: { removal in
+            Text(removal.message)
+        }
         .font(MarinaTypography.body)
+    }
+
+    private func confirm(_ removal: PendingRemoval) {
+        switch removal {
+        case .project(let id, _, _): supervisor.removeProject(id: id)
+        case .server(let id, _, _): supervisor.removeServer(id: id)
+        }
+        pendingRemoval = nil
     }
 
     // MARK: - Sidebar
@@ -436,7 +495,13 @@ struct MainView: View {
             NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: NSString(string: project.root).expandingTildeInPath)
         }
         Divider()
-        Button("Remove Project") { supervisor.removeProject(id: project.id) }
+        Button("Remove Project", role: .destructive) {
+            pendingRemoval = .project(
+                id: project.id,
+                name: project.name,
+                servers: project.servers.count
+            )
+        }
     }
 
     @ViewBuilder
@@ -457,7 +522,13 @@ struct MainView: View {
             editingServer = EditingServer(projectID: project.id, projectName: project.name, projectRoot: project.root, server: runtime.config)
         }
         Divider()
-        Button("Remove Server") { supervisor.removeServer(id: runtime.id) }
+        Button("Remove Server", role: .destructive) {
+            pendingRemoval = .server(
+                id: runtime.id,
+                name: runtime.config.name,
+                project: project.name
+            )
+        }
     }
 
     @ViewBuilder

@@ -22,6 +22,11 @@ public enum MarinaPaths {
         configDirectory.appendingPathComponent("logs", isDirectory: true)
     }
 
+    /// Where `ConfigBackups` keeps the generations of `config.json`.
+    public static var backupsDirectory: URL {
+        configDirectory.appendingPathComponent("backups", isDirectory: true)
+    }
+
     public static func logFile(forServer id: String) -> URL {
         logsDirectory.appendingPathComponent("\(id).log")
     }
@@ -46,7 +51,7 @@ public enum MarinaPaths {
 
     public static func ensureDirectories() {
         let fm = FileManager.default
-        for directory in [configDirectory, logsDirectory] {
+        for directory in [configDirectory, logsDirectory, backupsDirectory] {
             try? fm.createDirectory(
                 at: directory,
                 withIntermediateDirectories: true,

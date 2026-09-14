@@ -39,6 +39,9 @@ public final class ConfigStore {
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(config)
         MarinaPaths.ensureDirectories()
+        // The previous generation goes to `backups/` first: this file is the only
+        // record of a project's servers, and removing one is not undoable.
+        ConfigBackups.snapshot(before: data, replacing: url)
         try data.write(to: url, options: .atomic)
         // Server environments live in this file, so it must not be other-readable.
         // An atomic write replaces the inode, so the mode is reapplied every time.
