@@ -40,6 +40,10 @@ final class ServerRuntime: NSObject, ObservableObject, LocalProcessDelegate, Ter
     /// treated as a crash.
     private var manualStop = false
     private var healthTimer: Timer?
+    /// One-second probes left before a server that is still starting falls
+    /// back to the steady health interval.
+    private var startupProbesRemaining = 0
+    private static let startupProbeLimit = 30
     private var restartWork: DispatchWorkItem?
     private var killWork: DispatchWorkItem?
     private var takeoverPending = false
@@ -474,6 +478,7 @@ final class ServerRuntime: NSObject, ObservableObject, LocalProcessDelegate, Ter
     private func startHealthTimer() {
         stopHealthTimer()
         let interval = TimeInterval(max(2, settings.healthIntervalSeconds))
+        startupProbesRemaining = Self.startupProbeLimit
         // Probe quickly at first so a server that binds fast turns green fast.
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] t in
             guard let self else { return }
@@ -485,6 +490,14 @@ final class ServerRuntime: NSObject, ObservableObject, LocalProcessDelegate, Ter
                 }
             }
             self.runHealthCheck()
+            // Most dev servers bind within seconds. One still starting after
+            // the startup window is slow or misconfigured, and probing it every
+            // second for as long as that lasts only keeps a core awake.
+            self.startupProbesRemaining -= 1
+            if self.startupProbesRemaining <= 0 {
+                self.stopHealthTimer()
+                self.startSteadyHealthTimer(interval: interval)
+            }
         }
         // The startup probe is deliberately impatient, but it still does not
         // need to interrupt an idle core on an exact deadline.
@@ -518,31 +531,42 @@ final class ServerRuntime: NSObject, ObservableObject, LocalProcessDelegate, Ter
 
     private func handleHealthResult(_ ok: Bool) {
         guard isRunning else { return }
-        healthy = ok
+        // A steady server gives the same answer every probe. Publishing it
+        // anyway redrew every view bound to this runtime and, through
+        // `onStateChange`, the whole window and the menu bar label — once per
+        // server per interval, for as long as Marina runs.
+        let healthChanged = healthy != ok
+        if healthChanged { healthy = ok }
 
         if ok {
             consecutiveHealthFailures = 0
             lastHealthyAt = Date()
-            if state != .running { setState(.running) }
-            onStateChange?()
+            if state != .running {
+                setState(.running)
+            } else if healthChanged {
+                onStateChange?()
+            }
             return
         }
 
         // Grace period: a starting server has not bound its port yet.
         if state == .starting {
-            onStateChange?()
+            if healthChanged { onStateChange?() }
             return
         }
 
         consecutiveHealthFailures += 1
-        if state == .running { setState(.unhealthy) }
+        if state == .running {
+            setState(.unhealthy)
+        } else if healthChanged {
+            onStateChange?()
+        }
         // Three misses in a row is a hung server, not a blip.
         if consecutiveHealthFailures >= 3, config.autoRestart {
             logs.note("health check failed \(consecutiveHealthFailures)x, restarting")
             consecutiveHealthFailures = 0
             stop(then: { [weak self] in self?.handleCrashRestart(reason: "unhealthy") })
         }
-        onStateChange?()
     }
 
     // MARK: - Restart policy

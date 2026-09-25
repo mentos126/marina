@@ -5,6 +5,9 @@ import SwiftUI
 
 struct ResourceDashboard: View {
     @EnvironmentObject private var supervisor: Supervisor
+    /// Changes on every sample, which is also what keeps the per-server rows
+    /// below current: the supervisor no longer publishes for a sample.
+    @ObservedObject private var history = Supervisor.shared.history
     @State private var pendingExternalStop: ExternalProcessSnapshot?
     @State private var processActionError: String?
     @State private var stoppingProcessIDs = Set<Int32>()
@@ -111,7 +114,7 @@ struct ResourceDashboard: View {
                     metrics: $0.metrics
                 )
             },
-            projectHistory: supervisor.projectResourceHistory,
+            projectHistory: history.projectResourceHistory,
             externalProcesses: externalProcesses,
             physicalMemoryBytes: physicalMemoryBytes
         )
@@ -572,7 +575,7 @@ struct ResourceDashboard: View {
             title: "Managed memory history",
             subtitle: "All managed projects · five-minute window"
         ) {
-            if supervisor.resourceHistory.count < 2 {
+            if history.resourceHistory.count < 2 {
                 VStack(spacing: 10) {
                     ProgressView()
                         .controlSize(.small)
@@ -588,7 +591,7 @@ struct ResourceDashboard: View {
                         legend("Resident", color: .blue)
                     }
 
-                    Chart(supervisor.resourceHistory) { point in
+                    Chart(history.resourceHistory) { point in
                         AreaMark(
                             x: .value("Time", point.timestamp),
                             y: .value("Footprint", gibibytes(point.footprintBytes))
@@ -645,7 +648,7 @@ struct ResourceDashboard: View {
     }
 
     private var projectHistory: some View {
-        let history = supervisor.projectResourceHistory
+        let history = self.history.projectResourceHistory
         let activeProjects = projectRows
         let styles = DashboardProjectChartStyleScale.make(
             history: history,

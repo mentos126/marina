@@ -21,14 +21,23 @@ struct ProjectResourceHistoryPoint: Identifiable, Equatable {
     let residentBytes: UInt64
 }
 
+/// The sampler's rolling history, published apart from the supervisor.
+///
+/// A point is appended on every sample. On the supervisor itself that append
+/// invalidated the whole window and the menu bar label every sample, whether or
+/// not a chart was on screen; here it only reaches the views that plot it.
+final class ResourceHistoryStore: ObservableObject {
+    @Published fileprivate(set) var resourceHistory: [ResourceHistoryPoint] = []
+    @Published fileprivate(set) var projectResourceHistory: [ProjectResourceHistoryPoint] = []
+}
+
 /// Owns the config and one `ServerRuntime` per configured server. Single source
 /// of truth for the UI, the control API and the config file.
 final class Supervisor: ObservableObject {
     static let shared = Supervisor()
 
     @Published private(set) var projects: [Project] = []
-    @Published private(set) var resourceHistory: [ResourceHistoryPoint] = []
-    @Published private(set) var projectResourceHistory: [ProjectResourceHistoryPoint] = []
+    let history = ResourceHistoryStore()
     @Published private(set) var externalProcesses: [ExternalProcessSnapshot] = []
     @Published private(set) var temporaryRuntimeIDs: [String] = []
     @Published private(set) var memoryLimitRestarts: [String: MemoryLimitRestartEvent] = [:]
@@ -300,7 +309,11 @@ final class Supervisor: ObservableObject {
         }
         recordResourceHistory(samples: sample.managedByRoot, targets: targets)
         evaluateMemoryLimits(samples: sample.managedByRoot, targets: targets)
-        bump()
+        // No `bump()`: a sample changes numbers, not state. Each runtime
+        // publishes its own metrics and the history store its own points, so
+        // only the views showing them redraw. The schedule is still re-read so
+        // the control API's interest window expires on time.
+        updateMetricsSchedule()
     }
 
     private func recordResourceHistory(
@@ -315,12 +328,16 @@ final class Supervisor: ObservableObject {
             cpuPercent: samples.values.reduce(0) { $0 + $1.cpuPercent },
             processCount: samples.values.reduce(0) { $0 + $1.processCount }
         )
+        // Built locally and assigned once: each in-place mutation of a
+        // published array is its own change notification.
+        var resourceHistory = history.resourceHistory
         resourceHistory.append(point)
         // Five minutes at the two-second sampling interval is enough to reveal
         // runaway growth without turning the monitor into another memory sink.
         if resourceHistory.count > 150 {
             resourceHistory.removeFirst(resourceHistory.count - 150)
         }
+        history.resourceHistory = resourceHistory
 
         struct ProjectTotals {
             let name: String
@@ -341,6 +358,7 @@ final class Supervisor: ObservableObject {
             projectTotals[runtime.projectID] = total
         }
 
+        var projectResourceHistory = history.projectResourceHistory
         projectResourceHistory.append(contentsOf: projectTotals.map { projectID, total in
             ProjectResourceHistoryPoint(
                 timestamp: now,
@@ -353,6 +371,7 @@ final class Supervisor: ObservableObject {
         })
         let cutoff = now.addingTimeInterval(-300)
         projectResourceHistory.removeAll { $0.timestamp < cutoff }
+        history.projectResourceHistory = projectResourceHistory
     }
 
     private func evaluateMemoryLimits(
@@ -362,7 +381,11 @@ final class Supervisor: ObservableObject {
     ) {
         let projectIDs = Set(projects.map(\.id))
         memoryLimitGuard.removeProjects(except: projectIDs)
-        memoryLimitRestarts = memoryLimitRestarts.filter { projectIDs.contains($0.key) }
+        // Reassigning an unchanged dictionary still publishes, every sample.
+        let retainedRestarts = memoryLimitRestarts.filter { projectIDs.contains($0.key) }
+        if retainedRestarts.count != memoryLimitRestarts.count {
+            memoryLimitRestarts = retainedRestarts
+        }
 
         for project in projects {
             let running = runtimes(inProject: project.id).filter(\.isRunning)

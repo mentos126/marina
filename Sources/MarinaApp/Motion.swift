@@ -26,4 +26,9 @@ enum Motion {
 
     /// The breathing cadence of a server that is still coming up.
     static let pulse = Animation.easeInOut(duration: 0.85).repeatForever(autoreverses: true)
+
+    /// How long a settling server breathes. A repeating animation redraws the
+    /// window every frame; past the startup window a server stuck starting is
+    /// better told by its label than by a pulse that never ends.
+    static let pulseLimit: Duration = .seconds(30)
 }

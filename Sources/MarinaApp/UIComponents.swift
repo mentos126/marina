@@ -96,14 +96,15 @@ struct StatusDot: View {
             .scaleEffect(breathing && !reduceMotion ? 0.86 : 1)
             .animation(Motion.state, value: state)
             .animation(breathing ? Motion.pulse : Motion.state, value: breathing)
-            .onAppear { syncBreathing() }
-            .onChange(of: state) { syncBreathing() }
+            .task(id: state.isSettling) { await breathe() }
             .help(state.label)
     }
 
-    private func syncBreathing() {
-        guard breathing != state.isSettling else { return }
-        breathing = state.isSettling
+    private func breathe() async {
+        if breathing != state.isSettling { breathing = state.isSettling }
+        guard breathing else { return }
+        do { try await Task.sleep(for: Motion.pulseLimit) } catch { return }
+        breathing = false
     }
 }
 

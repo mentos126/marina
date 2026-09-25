@@ -262,6 +262,7 @@ private struct RuntimeSettingsView: View {
 
 private struct MemoryGuardSettingsView: View {
     @EnvironmentObject private var supervisor: Supervisor
+    @ObservedObject private var history = Supervisor.shared.history
     @State private var editingMemoryLimit: MemoryLimitEditorTarget?
 
     var body: some View {
@@ -334,7 +335,7 @@ private struct MemoryGuardSettingsView: View {
 
     private func projectRow(_ project: Project) -> some View {
         let limit = project.effectiveMemoryLimit(global: supervisor.settings.globalMemoryLimitBytes)
-        let footprint = supervisor.projectResourceHistory.last(where: { $0.projectID == project.id })?.footprintBytes ?? 0
+        let footprint = history.projectResourceHistory.last(where: { $0.projectID == project.id })?.footprintBytes ?? 0
         let ratio = limit.map { min(Double(footprint) / Double(max($0, 1)), 1) } ?? 0
         let color: Color = limit == nil ? .secondary : ratio >= 0.8 ? .orange : .green
 

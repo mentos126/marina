@@ -70,6 +70,9 @@ struct PortsView: View {
             }
         }
         .onChange(of: supervisor.revision) {
+            // Same `lsof` as the loop above. Hidden, the loop's own restart on
+            // visibility catches up, so a state change there is not worth one.
+            guard supervisor.uiIsVisible else { return }
             refresh()
         }
         .confirmationDialog(
